@@ -78,16 +78,18 @@ ExecStart=/usr/local/bin/ctx-delta-relay receiver \
   --admin-listen 127.0.0.1:18081 \
   --upstream-url http://127.0.0.1:3000 \
   --max-cache-mb 256 \
-  --max-inflight-mb 64 \
+  --max-inflight-mb 96 \
+  --max-concurrent-requests 256 \
   --max-codec-concurrency 4 \
   --ttl-secs 1800 \
   --max-body-mb 16 \
   --cache-zstd-level 1 \
+  --body-read-timeout-secs 30 \
   --read-timeout-secs 300
 Restart=always
 RestartSec=2s
-# 系统级硬内存兜底（缓存上限 256M + 并发内存预算 64M + 运行时富余 128M）
-MemoryMax=448M
+# 系统级硬内存兜底（缓存上限 256M + 并发内存预算 96M + 运行时富余 128M）
+MemoryMax=480M
 NoNewPrivileges=yes
 PrivateTmp=yes
 
@@ -223,16 +225,18 @@ ExecStart=/usr/local/bin/ctx-delta-relay sender \
   --admin-listen 127.0.0.1:18081 \
   --receiver-url https://relay.example.com:18443 \
   --max-cache-mb 256 \
-  --max-inflight-mb 64 \
+  --max-inflight-mb 96 \
+  --max-concurrent-requests 256 \
   --max-codec-concurrency 4 \
   --ttl-secs 1500 \
   --min-delta-bytes 4096 \
   --max-body-mb 16 \
   --zstd-level 3 \
+  --body-read-timeout-secs 30 \
   --read-timeout-secs 300
 Restart=always
 RestartSec=2s
-MemoryMax=448M
+MemoryMax=480M
 NoNewPrivileges=yes
 PrivateTmp=yes
 

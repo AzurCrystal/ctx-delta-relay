@@ -2,6 +2,8 @@ use zstd_safe::{CCtx, CParameter, DCtx, DParameter};
 
 /// Maximum windowLog supported (25 => 32 MiB window, covers 16 MiB base + 16 MiB body).
 pub const MAX_WINDOW_LOG: u32 = 25;
+/// Cap LDM hash table size (2^20 entries * 8 B ~= 8 MiB) so a single CCtx never explodes RAM.
+pub const MAX_LDM_HASH_LOG: u32 = 20;
 
 #[derive(Debug)]
 pub struct CodecError(pub String);
@@ -25,7 +27,7 @@ pub fn max_wire_body_bytes(max_raw_bytes: usize) -> usize {
 }
 
 /// Compute minimum windowLog (clamped to 18..=MAX_WINDOW_LOG) that covers `total_bytes`.
-fn required_window_log(total_bytes: usize) -> u32 {
+pub fn required_window_log(total_bytes: usize) -> u32 {
     let needed = total_bytes.max(1 << 18);
     let mut log = 18u32;
     while (1usize << log) < needed && log < MAX_WINDOW_LOG {
@@ -34,8 +36,47 @@ fn required_window_log(total_bytes: usize) -> u32 {
     log
 }
 
-/// Compress `raw` standalone using zstd and shrink to an exact-sized boxed slice
-/// (no wasted compress_bound spare capacity retained in cache!).
+/// Conservative working-set RAM estimate for standalone compression (input + output bound + CCtx tables).
+pub fn estimate_standalone_compress_mem(raw_len: usize) -> usize {
+    // Output buffer `compress_bound(raw_len)` + CCtx internal hash/chain tables (~4 MiB for level <= 6).
+    zstd_safe::compress_bound(raw_len).saturating_add(4 * 1024 * 1024)
+}
+
+/// Conservative working-set RAM estimate for delta compression (base_raw + output bound + CCtx + LDM table).
+pub fn estimate_delta_compress_mem(raw_len: usize, approx_base_len: usize) -> usize {
+    let wlog = required_window_log(approx_base_len.saturating_add(raw_len));
+    // CCtx window + hash/chain + capped LDM hash table (<= 8 MiB).
+    let ldm_and_cctx = (1usize << wlog.min(22)).saturating_add(8 * 1024 * 1024);
+    approx_base_len
+        .saturating_add(zstd_safe::compress_bound(raw_len))
+        .saturating_add(ldm_and_cctx)
+}
+
+/// Conservative working-set RAM estimate for receiver delta decompression + cache recompress.
+pub fn estimate_delta_decompress_mem(raw_len: usize, approx_base_len: usize) -> usize {
+    // base_raw + reconstructed raw + level-1 recompressed output buffer + DCtx/CCtx overhead.
+    approx_base_len
+        .saturating_add(raw_len)
+        .saturating_add(zstd_safe::compress_bound(raw_len))
+        .saturating_add(4 * 1024 * 1024)
+}
+
+/// Conservative working-set RAM estimate for receiver full standalone decompression.
+pub fn estimate_full_decompress_mem(raw_len: usize, wire_len: usize) -> usize {
+    raw_len.saturating_add(wire_len).saturating_add(512 * 1024)
+}
+
+/// Minimum recommended `max_inflight_bytes` to guarantee at least one worst-case `max_body_bytes`
+/// request can complete on either sender or receiver without violating the memory budget (R2-05 & R2-14).
+pub fn minimum_inflight_budget_bytes(max_body_bytes: usize) -> usize {
+    let sender_worst =
+        max_body_bytes.saturating_add(estimate_delta_compress_mem(max_body_bytes, max_body_bytes));
+    let receiver_worst = max_wire_body_bytes(max_body_bytes)
+        .saturating_add(estimate_delta_decompress_mem(max_body_bytes, max_body_bytes));
+    sender_worst.max(receiver_worst)
+}
+
+/// Compress `raw` standalone using zstd and shrink to an exact-sized boxed slice.
 pub fn compress_standalone(raw: &[u8], level: i32) -> Result<Box<[u8]>, CodecError> {
     let mut cctx = CCtx::create();
     cctx.set_parameter(CParameter::CompressionLevel(level))
@@ -72,21 +113,24 @@ pub fn decompress_standalone(
     Ok(out)
 }
 
+/// Read the uncompressed content size embedded in a cached zstd snapshot frame header.
+pub fn cached_snapshot_raw_len(compressed: &[u8]) -> Result<usize, CodecError> {
+    let content_size = zstd_safe::get_frame_content_size(compressed)
+        .map_err(|_| CodecError("invalid zstd frame content size".into()))?
+        .ok_or_else(|| CodecError("zstd frame missing content size".into()))?;
+    usize::try_from(content_size).map_err(|_| CodecError("frame content size overflow".into()))
+}
+
 /// Decompress an internally cached snapshot whose exact raw length is stored in the zstd frame header.
 pub fn decompress_cached_snapshot(
     compressed: &[u8],
     max_raw_len: usize,
 ) -> Result<Vec<u8>, CodecError> {
-    let content_size = zstd_safe::get_frame_content_size(compressed)
-        .map_err(|_| CodecError("invalid zstd frame content size".into()))?
-        .ok_or_else(|| CodecError("zstd frame missing content size".into()))?;
-    let expected = usize::try_from(content_size)
-        .map_err(|_| CodecError("frame content size overflow".into()))?;
+    let expected = cached_snapshot_raw_len(compressed)?;
     decompress_standalone(compressed, expected, max_raw_len)
 }
 
 /// Compress `raw` as a byte-exact delta against `base_raw` using zstd raw prefix dictionary + LDM.
-/// Allocates full `compress_bound(raw.len())` up front and shrinks to exact size on return.
 pub fn compress_delta(raw: &[u8], base_raw: &[u8], level: i32) -> Result<Box<[u8]>, CodecError> {
     let mut cctx = CCtx::create();
     let wlog = required_window_log(base_raw.len().saturating_add(raw.len()));
@@ -95,6 +139,8 @@ pub fn compress_delta(raw: &[u8], base_raw: &[u8], level: i32) -> Result<Box<[u8
     cctx.set_parameter(CParameter::WindowLog(wlog))
         .map_err(map_zstd_err)?;
     cctx.set_parameter(CParameter::EnableLongDistanceMatching(true))
+        .map_err(map_zstd_err)?;
+    cctx.set_parameter(CParameter::LdmHashLog(wlog.min(MAX_LDM_HASH_LOG)))
         .map_err(map_zstd_err)?;
     cctx.ref_prefix(base_raw).map_err(map_zstd_err)?;
 
@@ -174,11 +220,12 @@ mod tests {
 
     #[test]
     fn incompressible_payload_does_not_fail_buffer_bound() {
-        // Pseudo-random incompressible 256 KiB payload.
         let mut state: u64 = 0x1234_5678_9abc_def0;
         let mut data = vec![0u8; 256 * 1024];
         for b in &mut data {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (state >> 33) as u8;
         }
         let base = vec![0xAAu8; 64 * 1024];

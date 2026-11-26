@@ -13,6 +13,8 @@ pub struct RelayMetrics {
     pub overload_rejects_total: AtomicU64,
     pub raw_bytes_total: AtomicU64,
     pub wire_bytes_total: AtomicU64,
+    /// Wire bytes transmitted on attempts that ultimately errored (also included in `wire_bytes_total`).
+    pub failed_wire_bytes_total: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -28,6 +30,7 @@ pub struct StatsSnapshot {
     pub overload_rejects_total: u64,
     pub raw_bytes_total: u64,
     pub wire_bytes_total: u64,
+    pub failed_wire_bytes_total: u64,
     /// Signed net bytes saved (`raw - wire`); negative values surface overhead honestly.
     pub net_saved_bytes: i64,
     /// True signed percentage `((raw - wire) / raw) * 100.0`.
@@ -49,7 +52,8 @@ impl RelayMetrics {
     ) -> StatsSnapshot {
         let raw = self.raw_bytes_total.load(Ordering::Relaxed);
         let wire = self.wire_bytes_total.load(Ordering::Relaxed);
-        let net_saved_bytes = (raw as i128 - wire as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+        let net_saved_bytes =
+            (raw as i128 - wire as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
         let savings_percent = if raw > 0 {
             (((raw as f64) - (wire as f64)) / (raw as f64)) * 100.0
         } else {
@@ -67,6 +71,7 @@ impl RelayMetrics {
             overload_rejects_total: self.overload_rejects_total.load(Ordering::Relaxed),
             raw_bytes_total: raw,
             wire_bytes_total: wire,
+            failed_wire_bytes_total: self.failed_wire_bytes_total.load(Ordering::Relaxed),
             net_saved_bytes,
             savings_percent: (savings_percent * 100.0).round() / 100.0,
             lru_entries,

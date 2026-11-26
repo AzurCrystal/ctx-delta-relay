@@ -32,8 +32,7 @@ pub fn verify_secret(headers: &HeaderMap, expected: &str) -> bool {
     verify_header_secret(headers, HDR_AUTH, expected)
 }
 
-/// Detect WebSocket upgrade attempts so they are explicitly rejected with 501 instead of
-/// silently mangled into broken plain HTTP requests.
+/// Detect WebSocket upgrade attempts so they are explicitly rejected with 501.
 pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::UPGRADE)
@@ -58,50 +57,47 @@ fn connection_nominated_headers(headers: &HeaderMap) -> HashSet<String> {
     out
 }
 
-/// Static hop-by-hop and internal delta headers stripped from forwarded requests.
+/// Static hop-by-hop (RFC 9110 §7.6.1 + §6.5.1 `trailer`) and ALL internal `x-delta-*` headers
+/// stripped from forwarded requests (fixes R2-12).
 pub fn is_stripped_request_header(name: &HeaderName) -> bool {
     let s = name.as_str();
-    matches!(
-        s,
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-            | "content-length"
-            | HDR_AUTH
-            | HDR_CLIENT_AUTH
-            | HDR_MODE
-            | HDR_BASE
-            | HDR_FULL
-            | HDR_RAW_LEN
-            | HDR_MISS
-            | HDR_CACHED
-    )
+    s.starts_with("x-delta-")
+        || matches!(
+            s,
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "http2-settings"
+                | "host"
+                | "content-length"
+        )
 }
 
-/// Static hop-by-hop and internal delta headers stripped from forwarded responses.
+/// Static hop-by-hop and ALL internal `x-delta-*` headers stripped from forwarded responses (fixes R2-12).
 pub fn is_stripped_response_header(name: &HeaderName) -> bool {
     let s = name.as_str();
-    matches!(
-        s,
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailers"
-            | "transfer-encoding"
-            | "upgrade"
-            | HDR_MISS
-            | HDR_CACHED
-    )
+    s.starts_with("x-delta-")
+        || matches!(
+            s,
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "te"
+                | "trailer"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "http2-settings"
+        )
 }
 
 /// Copy headers while stripping both static hop-by-hop/internal headers AND any headers
@@ -115,6 +111,60 @@ pub fn copy_filtered_headers(src: &HeaderMap, filter: fn(&HeaderName) -> bool) -
         }
     }
     dst
+}
+
+/// Derive a 32-byte tenant/credential isolation scope from ALL common API auth headers & query key
+/// so distinct tenants can never collide in sender session index OR share cache entries on receiver (R2-07).
+pub fn derive_tenant_scope(headers: &HeaderMap, query: Option<&str>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ctx-delta-tenant-v1\0");
+
+    let mut found_any = false;
+    for hdr in [
+        "authorization",
+        "x-api-key",
+        "x-goog-api-key",
+        "api-key",
+        "x-tenant-id",
+    ] {
+        for val in headers.get_all(hdr) {
+            if !val.is_empty() {
+                found_any = true;
+                hasher.update(&(hdr.len() as u32).to_le_bytes());
+                hasher.update(hdr.as_bytes());
+                hasher.update(&(val.len() as u64).to_le_bytes());
+                hasher.update(val.as_bytes());
+            }
+        }
+    }
+
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=')
+                && matches!(k, "key" | "api_key" | "apikey")
+                && !v.is_empty()
+            {
+                found_any = true;
+                hasher.update(b"qkey");
+                hasher.update(&(v.len() as u64).to_le_bytes());
+                hasher.update(v.as_bytes());
+            }
+        }
+    }
+
+    if !found_any {
+        hasher.update(b"anonymous");
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Combine tenant scope + content hash into an isolated cache key on receiver/sender (R2-07).
+pub fn scoped_cache_key(tenant_scope: &[u8; 32], content_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ctx-delta-scoped-key-v1\0");
+    hasher.update(tenant_scope);
+    hasher.update(content_hash);
+    *hasher.finalize().as_bytes()
 }
 
 pub fn hash_to_hex(hash: &[u8; 32]) -> String {
@@ -165,22 +215,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_connection_nominated_hop_by_hop_headers() {
+    fn strips_trailer_internal_x_delta_and_connection_nominated_headers() {
         let mut src = HeaderMap::new();
         src.insert(
             http::header::CONNECTION,
             HeaderValue::from_static("keep-alive, X-Custom-Hop, X-Trace-Hop"),
         );
+        src.insert("trailer", HeaderValue::from_static("Expires"));
+        src.insert("http2-settings", HeaderValue::from_static("AAMAAABkAAQAAP__"));
         src.insert("x-custom-hop", HeaderValue::from_static("drop-me"));
         src.insert("x-trace-hop", HeaderValue::from_static("drop-me-too"));
+        src.insert("x-delta-unknown-future", HeaderValue::from_static("strip-me"));
         src.insert("x-keep-me", HeaderValue::from_static("preserve"));
         src.insert(HDR_CLIENT_AUTH, HeaderValue::from_static("secret"));
 
         let dst = copy_filtered_headers(&src, is_stripped_request_header);
         assert!(dst.get(http::header::CONNECTION).is_none());
+        assert!(dst.get("trailer").is_none());
+        assert!(dst.get("http2-settings").is_none());
         assert!(dst.get("x-custom-hop").is_none());
         assert!(dst.get("x-trace-hop").is_none());
+        assert!(dst.get("x-delta-unknown-future").is_none());
         assert!(dst.get(HDR_CLIENT_AUTH).is_none());
         assert_eq!(dst.get("x-keep-me").unwrap(), "preserve");
+    }
+
+    #[test]
+    fn tenant_scope_isolates_api_key_headers_and_query_keys() {
+        let mut h1 = HeaderMap::new();
+        h1.insert("x-goog-api-key", HeaderValue::from_static("key-tenant-a"));
+        let mut h2 = HeaderMap::new();
+        h2.insert("x-goog-api-key", HeaderValue::from_static("key-tenant-b"));
+
+        assert_ne!(derive_tenant_scope(&h1, None), derive_tenant_scope(&h2, None));
+
+        let empty = HeaderMap::new();
+        assert_ne!(
+            derive_tenant_scope(&empty, Some("key=alpha")),
+            derive_tenant_scope(&empty, Some("key=beta"))
+        );
     }
 }

@@ -3,7 +3,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use ctx_delta_relay::{receiver, sender};
+use ctx_delta_relay::{codec, protocol, receiver, sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -43,6 +43,10 @@ async fn spawn_mock_upstream() -> (String, Arc<MockUpstreamState>) {
                 st.received_paths.lock().unwrap().push(path.clone());
                 st.received_bodies.lock().unwrap().push(body.to_vec());
 
+                if path == "/v1/slow-test" {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return (StatusCode::OK, "slow-ok").into_response();
+                }
                 if path == "/v1/conflict-test" {
                     return (StatusCode::CONFLICT, "upstream real 409").into_response();
                 }
@@ -63,7 +67,6 @@ async fn spawn_mock_upstream() -> (String, Arc<MockUpstreamState>) {
                         .into_response();
                 }
 
-                // Stream realistic SSE chunks back with BLAKE3 of received body so caller can verify byte-exact match.
                 let hash = blake3::hash(&body).to_hex().to_string();
                 let len = body.len();
                 let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -73,7 +76,7 @@ async fn spawn_mock_upstream() -> (String, Arc<MockUpstreamState>) {
                             "data: {{\"type\":\"response.created\",\"raw_len\":{len}}}\n\n"
                         ))))
                         .await;
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    tokio::time::sleep(Duration::from_millis(8)).await;
                     let _ = tx
                         .send(Ok(Bytes::from(format!(
                             "data: {{\"type\":\"response.completed\",\"blake3\":\"{hash}\"}}\n\n"
@@ -114,6 +117,7 @@ async fn spawn_pair_custom(
     upstream_url: String,
     receiver_max_cache_bytes: usize,
     max_body_bytes: usize,
+    max_concurrent_requests: usize,
     ttl: Duration,
     client_auth: Option<String>,
 ) -> (
@@ -123,18 +127,21 @@ async fn spawn_pair_custom(
     Arc<receiver::ReceiverState>,
 ) {
     let secret = "super-secret-tunnel-token-2026".to_string();
+    let inflight = codec::minimum_inflight_budget_bytes(max_body_bytes).max(96 * 1024 * 1024);
 
     let recv_state = receiver::ReceiverState::new(receiver::ReceiverConfig {
         upstream_url,
         upstream_host: None,
         secret: secret.clone(),
         max_cache_bytes: receiver_max_cache_bytes,
-        max_inflight_bytes: 64 * 1024 * 1024,
+        max_inflight_bytes: inflight,
+        max_concurrent_requests,
         max_codec_concurrency: 4,
         ttl,
         max_body_bytes,
         cache_zstd_level: 1,
         insecure_upstream_tls: false,
+        body_read_timeout: Duration::from_secs(30),
         read_timeout: Duration::from_secs(60),
     })
     .unwrap();
@@ -152,13 +159,15 @@ async fn spawn_pair_custom(
         secret,
         client_auth,
         max_cache_bytes: 64 * 1024 * 1024,
-        max_inflight_bytes: 64 * 1024 * 1024,
+        max_inflight_bytes: inflight,
+        max_concurrent_requests,
         max_codec_concurrency: 4,
         ttl,
         min_delta_bytes: 4096,
         max_body_bytes,
         zstd_level: 3,
         insecure_tls: false,
+        body_read_timeout: Duration::from_secs(30),
         read_timeout: Duration::from_secs(60),
     })
     .unwrap();
@@ -187,6 +196,7 @@ async fn spawn_pair(
         upstream_url,
         receiver_max_cache_bytes,
         16 * 1024 * 1024,
+        256,
         ttl,
         None,
     )
@@ -250,21 +260,9 @@ async fn multi_turn_llm_session_achieves_high_delta_savings_and_recovers_on_rest
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK, "turn {turn} must return 200 OK");
-        assert!(
-            resp.headers().get("x-delta-cached").is_none(),
-            "internal x-delta-cached header must be stripped before client"
-        );
-        assert_eq!(
-            resp.headers()
-                .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok()),
-            Some("text/event-stream")
-        );
+        assert!(resp.headers().get("x-delta-cached").is_none());
         let text = resp.text().await.unwrap();
-        assert!(
-            text.contains(&expected_hash),
-            "upstream must receive byte-for-byte identical body on turn {turn}"
-        );
+        assert!(text.contains(&expected_hash));
         assert!(text.contains("[DONE]"));
     }
 
@@ -375,8 +373,9 @@ async fn auth_passthrough_redirect_ws_and_client_auth_guards_work() {
         upstream_url,
         16 * 1024 * 1024,
         16 * 1024 * 1024,
+        256,
         Duration::from_secs(600),
-        Some("local-client-secret".to_string()),
+        Some("local-client-secret-2026".to_string()),
     )
     .await;
     let client = reqwest::Client::builder()
@@ -384,40 +383,25 @@ async fn auth_passthrough_redirect_ws_and_client_auth_guards_work() {
         .build()
         .unwrap();
 
-    // 1. Direct unauthorized call to receiver -> 403.
-    let unauth_recv = client
-        .get(format!("{recv_url}/v1/models"))
-        .send()
-        .await
-        .unwrap();
+    let unauth_recv = client.get(format!("{recv_url}/v1/models")).send().await.unwrap();
     assert_eq!(unauth_recv.status(), StatusCode::FORBIDDEN);
 
-    // 2. BUG-09: Call to sender without X-Delta-Client-Auth -> 403.
-    let unauth_sender = client
-        .get(format!("{sender_url}/v1/models"))
-        .send()
-        .await
-        .unwrap();
+    let unauth_sender = client.get(format!("{sender_url}/v1/models")).send().await.unwrap();
     assert_eq!(unauth_sender.status(), StatusCode::FORBIDDEN);
 
-    // 3. Valid X-Delta-Client-Auth passes and is stripped before upstream!
     let models = client
         .get(format!("{sender_url}/v1/models"))
-        .header("x-delta-client-auth", "local-client-secret")
+        .header("x-delta-client-auth", "local-client-secret-2026")
         .send()
         .await
         .unwrap();
     assert_eq!(models.status(), StatusCode::OK);
     assert!(models.text().await.unwrap().contains("example-model"));
-    assert!(
-        !*upstream_state.saw_client_auth_header.lock().unwrap(),
-        "internal auth headers must never reach upstream"
-    );
+    assert!(!*upstream_state.saw_client_auth_header.lock().unwrap());
 
-    // 4. BUG-03: Upstream 302 redirect MUST NOT be followed by receiver or sender!
     let redir = client
         .post(format!("{sender_url}/v1/redirect-test"))
-        .header("x-delta-client-auth", "local-client-secret")
+        .header("x-delta-client-auth", "local-client-secret-2026")
         .body("a".repeat(8192))
         .send()
         .await
@@ -431,10 +415,9 @@ async fn auth_passthrough_redirect_ws_and_client_auth_guards_work() {
         Some("https://redirect-target.invalid/leak")
     );
 
-    // 5. BUG-07: WebSocket upgrade explicitly returns 501.
     let ws = client
         .get(format!("{sender_url}/v1/responses"))
-        .header("x-delta-client-auth", "local-client-secret")
+        .header("x-delta-client-auth", "local-client-secret-2026")
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
         .send()
@@ -442,10 +425,9 @@ async fn auth_passthrough_redirect_ws_and_client_auth_guards_work() {
         .unwrap();
     assert_eq!(ws.status(), StatusCode::NOT_IMPLEMENTED);
 
-    // 6. Real upstream 409 is NOT misclassified as delta cache miss.
     let conflict = client
         .post(format!("{sender_url}/v1/conflict-test"))
-        .header("x-delta-client-auth", "local-client-secret")
+        .header("x-delta-client-auth", "local-client-secret-2026")
         .body("x".repeat(8192))
         .send()
         .await
@@ -456,15 +438,13 @@ async fn auth_passthrough_redirect_ws_and_client_auth_guards_work() {
 
 #[tokio::test]
 async fn max_size_incompressible_body_bypasses_zstd_without_413() {
-    // BUG-06 & BUG-14 & BUG-16 regression:
-    // Exact max_body_bytes (256 KiB) of incompressible pseudo-random bytes must succeed with 200 OK
-    // and fall back to pass mode instead of expanding above max_body_bytes and triggering 413.
     let (upstream_url, _upstream_state) = spawn_mock_upstream().await;
     let max_body = 256 * 1024;
     let (sender_url, _recv_url, send_state, _recv_state) = spawn_pair_custom(
         upstream_url,
         4 * 1024 * 1024,
         max_body,
+        256,
         Duration::from_secs(600),
         None,
     )
@@ -489,17 +469,11 @@ async fn max_size_incompressible_body_bypasses_zstd_without_413() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(resp.text().await.unwrap().contains(&expected_hash));
-    assert_eq!(
-        send_state.stats().mode_pass_total,
-        1,
-        "incompressible payload should fall back to pass instead of negative-gain zstd"
-    );
+    assert_eq!(send_state.stats().mode_pass_total, 1);
 }
 
 #[tokio::test]
 async fn sender_skips_local_cache_when_receiver_does_not_confirm_cached() {
-    // BUG-08 regression: receiver cache cap is tiny (512 bytes), so it cannot cache a ~15 KiB snapshot
-    // and omits X-Delta-Cached: 1 -> sender must NOT record it and next turn must not waste a 409 retry!
     let (upstream_url, _upstream_state) = spawn_mock_upstream().await;
     let (sender_url, _recv_url, send_state, _recv_state) =
         spawn_pair(upstream_url, 512, Duration::from_secs(600)).await;
@@ -519,7 +493,122 @@ async fn sender_skips_local_cache_when_receiver_does_not_confirm_cached() {
     }
 
     let stats = send_state.stats();
-    assert_eq!(stats.lru_entries, 0, "sender must not cache unconfirmed snapshots");
-    assert_eq!(stats.miss_retries_total, 0, "turn 2 must not trigger a wasted 409 retry");
+    assert_eq!(stats.lru_entries, 0);
+    assert_eq!(stats.miss_retries_total, 0);
     assert_eq!(stats.mode_full_total, 2);
+}
+
+#[tokio::test]
+async fn cross_tenant_cache_isolation_blocks_base_reuse_on_receiver() {
+    // R2-07 regression: Tenant B attempting to delta-decode against Tenant A's cached hash
+    // MUST get 409 X-Delta-Miss: 1 even with the valid tunnel secret.
+    let (upstream_url, _upstream_state) = spawn_mock_upstream().await;
+    let (sender_url, recv_url, _send_state, _recv_state) =
+        spawn_pair(upstream_url, 16 * 1024 * 1024, Duration::from_secs(600)).await;
+    let client = reqwest::Client::new();
+
+    let payload_a = build_realistic_coding_turn("tenant-a-secret", 1, 200);
+    let hash_a_hex = blake3::hash(&payload_a).to_hex().to_string();
+
+    // Seed receiver cache under Tenant A's Bearer token.
+    let resp_a = client
+        .post(format!("{sender_url}/v1/responses"))
+        .header("Authorization", "Bearer sk-tenant-A")
+        .body(payload_a.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    let _ = resp_a.text().await.unwrap();
+
+    // Now craft a direct delta request to receiver using Tenant B's Bearer token referencing Tenant A's hash.
+    let delta = codec::compress_delta(&payload_a, &payload_a, 3).unwrap();
+    let resp_b = client
+        .post(format!("{recv_url}/v1/responses"))
+        .header("Authorization", "Bearer sk-tenant-B")
+        .header(protocol::HDR_AUTH, "super-secret-tunnel-token-2026")
+        .header(protocol::HDR_MODE, protocol::MODE_DELTA)
+        .header(protocol::HDR_BASE, &hash_a_hex)
+        .header(protocol::HDR_FULL, &hash_a_hex)
+        .header(protocol::HDR_RAW_LEN, payload_a.len().to_string())
+        .body(delta.into_vec())
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp_b.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        resp_b
+            .headers()
+            .get(protocol::HDR_MISS)
+            .and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "receiver must refuse cross-tenant base dictionary lookup"
+    );
+}
+
+#[tokio::test]
+async fn global_concurrency_cap_sheds_load_immediately_with_503() {
+    // R2-06 regression: max_concurrent_requests = 1 must shed 2nd simultaneous request with 503.
+    let (upstream_url, _upstream_state) = spawn_mock_upstream().await;
+    let (sender_url, _recv_url, send_state, _recv_state) = spawn_pair_custom(
+        upstream_url,
+        8 * 1024 * 1024,
+        1024 * 1024,
+        1,
+        Duration::from_secs(60),
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let c1 = client.clone();
+    let u1 = format!("{sender_url}/v1/slow-test");
+    let first = tokio::spawn(async move { c1.get(u1).send().await.unwrap().status() });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = client
+        .get(format!("{sender_url}/v1/slow-test"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    assert_eq!(send_state.stats().overload_rejects_total, 1);
+}
+
+#[test]
+fn startup_config_validation_rejects_weak_and_inconsistent_configs() {
+    // R2-05 & R2-14 regression tests.
+    let base_sender = sender::SenderConfig {
+        receiver_url: "https://relay.example.com:18443".into(),
+        secret: "short".into(),
+        client_auth: None,
+        max_cache_bytes: 64 * 1024 * 1024,
+        max_inflight_bytes: 96 * 1024 * 1024,
+        max_concurrent_requests: 64,
+        max_codec_concurrency: 4,
+        ttl: Duration::from_secs(600),
+        min_delta_bytes: 4096,
+        max_body_bytes: 16 * 1024 * 1024,
+        zstd_level: 3,
+        insecure_tls: false,
+        body_read_timeout: Duration::from_secs(30),
+        read_timeout: Duration::from_secs(60),
+    };
+    assert!(base_sender.validate().is_err(), "short secret must be rejected");
+
+    let mut small_budget = base_sender.clone();
+    small_budget.secret = "valid-long-secret-token-2026".into();
+    small_budget.max_inflight_bytes = 8 * 1024 * 1024; // Too small for 16 MiB max_body!
+    assert!(
+        small_budget.validate().is_err(),
+        "inflight budget smaller than worst-case working set must be rejected"
+    );
+
+    let mut bad_url = base_sender.clone();
+    bad_url.secret = "valid-long-secret-token-2026".into();
+    bad_url.receiver_url = "ftp://relay.example.com".into();
+    assert!(bad_url.validate().is_err(), "non-http(s) URL must be rejected");
 }

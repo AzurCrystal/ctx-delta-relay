@@ -77,7 +77,11 @@
               };
               maxInflightMb = lib.mkOption {
                 type = lib.types.int;
-                default = 64;
+                default = 96;
+              };
+              maxConcurrentRequests = lib.mkOption {
+                type = lib.types.int;
+                default = 256;
               };
               maxCodecConcurrency = lib.mkOption {
                 type = lib.types.int;
@@ -121,7 +125,11 @@
               };
               maxInflightMb = lib.mkOption {
                 type = lib.types.int;
-                default = 64;
+                default = 96;
+              };
+              maxConcurrentRequests = lib.mkOption {
+                type = lib.types.int;
+                default = 256;
               };
               maxCodecConcurrency = lib.mkOption {
                 type = lib.types.int;
@@ -155,6 +163,7 @@
                       "--receiver-url=${cfg.sender.receiverUrl}"
                       "--max-cache-mb=${toString cfg.sender.maxCacheMb}"
                       "--max-inflight-mb=${toString cfg.sender.maxInflightMb}"
+                      "--max-concurrent-requests=${toString cfg.sender.maxConcurrentRequests}"
                       "--max-codec-concurrency=${toString cfg.sender.maxCodecConcurrency}"
                       "--ttl-secs=${toString cfg.sender.ttlSecs}"
                       "--zstd-level=${toString cfg.sender.zstdLevel}"
@@ -185,6 +194,7 @@
                       "--upstream-url=${cfg.receiver.upstreamUrl}"
                       "--max-cache-mb=${toString cfg.receiver.maxCacheMb}"
                       "--max-inflight-mb=${toString cfg.receiver.maxInflightMb}"
+                      "--max-concurrent-requests=${toString cfg.receiver.maxConcurrentRequests}"
                       "--max-codec-concurrency=${toString cfg.receiver.maxCodecConcurrency}"
                       "--ttl-secs=${toString cfg.receiver.ttlSecs}"
                     ]

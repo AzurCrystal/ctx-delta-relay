@@ -33,11 +33,11 @@ enum Command {
         #[arg(long, env = "DELTA_RECEIVER_URL")]
         receiver_url: String,
 
-        /// Pre-shared tunnel secret (X-Delta-Auth)
+        /// Pre-shared tunnel secret (X-Delta-Auth, minimum 16 chars)
         #[arg(long, env = "DELTA_SECRET")]
         secret: String,
 
-        /// Optional client access secret (X-Delta-Client-Auth) recommended if binding non-loopback
+        /// Optional client access secret (X-Delta-Client-Auth, >= 16 chars) recommended if binding non-loopback
         #[arg(long, env = "DELTA_CLIENT_AUTH")]
         client_auth: Option<String>,
 
@@ -45,9 +45,13 @@ enum Command {
         #[arg(long, env = "DELTA_MAX_CACHE_MB", default_value_t = 256)]
         max_cache_mb: usize,
 
-        /// Hard RAM budget in MiB for concurrent in-flight body & codec buffers
-        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 64)]
+        /// Hard RAM budget in MiB for concurrent in-flight body & zstd working sets
+        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 96)]
         max_inflight_mb: usize,
+
+        /// Maximum concurrent active requests before immediate 503 load shedding
+        #[arg(long, env = "DELTA_MAX_CONCURRENT_REQUESTS", default_value_t = 256)]
+        max_concurrent_requests: usize,
 
         /// Max concurrent blocking zstd codec tasks
         #[arg(long, env = "DELTA_MAX_CODEC_CONCURRENCY", default_value_t = 4)]
@@ -73,6 +77,10 @@ enum Command {
         #[arg(long, env = "DELTA_INSECURE_TLS", default_value_t = false)]
         insecure_tls: bool,
 
+        /// Maximum seconds allowed for a client to finish uploading the request body
+        #[arg(long, env = "DELTA_BODY_READ_TIMEOUT_SECS", default_value_t = 30)]
+        body_read_timeout_secs: u64,
+
         /// Idle read timeout per streamed response chunk in seconds
         #[arg(long, env = "DELTA_READ_TIMEOUT_SECS", default_value_t = 300)]
         read_timeout_secs: u64,
@@ -96,7 +104,7 @@ enum Command {
         #[arg(long, env = "DELTA_UPSTREAM_HOST")]
         upstream_host: Option<String>,
 
-        /// Pre-shared tunnel secret (X-Delta-Auth)
+        /// Pre-shared tunnel secret (X-Delta-Auth, minimum 16 chars)
         #[arg(long, env = "DELTA_SECRET")]
         secret: String,
 
@@ -104,9 +112,13 @@ enum Command {
         #[arg(long, env = "DELTA_MAX_CACHE_MB", default_value_t = 256)]
         max_cache_mb: usize,
 
-        /// Hard RAM budget in MiB for concurrent in-flight body & codec buffers
-        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 64)]
+        /// Hard RAM budget in MiB for concurrent in-flight body & zstd working sets
+        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 96)]
         max_inflight_mb: usize,
+
+        /// Maximum concurrent active requests before immediate 503 load shedding
+        #[arg(long, env = "DELTA_MAX_CONCURRENT_REQUESTS", default_value_t = 256)]
+        max_concurrent_requests: usize,
 
         /// Max concurrent blocking zstd codec tasks
         #[arg(long, env = "DELTA_MAX_CODEC_CONCURRENCY", default_value_t = 4)]
@@ -127,6 +139,10 @@ enum Command {
         /// Skip TLS cert verification when calling local upstream HTTPS
         #[arg(long, env = "DELTA_INSECURE_UPSTREAM_TLS", default_value_t = false)]
         insecure_upstream_tls: bool,
+
+        /// Maximum seconds allowed for a sender to finish uploading the wire body
+        #[arg(long, env = "DELTA_BODY_READ_TIMEOUT_SECS", default_value_t = 30)]
+        body_read_timeout_secs: u64,
 
         /// Idle read timeout per streamed response chunk in seconds
         #[arg(long, env = "DELTA_READ_TIMEOUT_SECS", default_value_t = 300)]
@@ -153,12 +169,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client_auth,
             max_cache_mb,
             max_inflight_mb,
+            max_concurrent_requests,
             max_codec_concurrency,
             ttl_secs,
             min_delta_bytes,
             max_body_mb,
             zstd_level,
             insecure_tls,
+            body_read_timeout_secs,
             read_timeout_secs,
         } => {
             if !listen.ip().is_loopback() && client_auth.is_none() {
@@ -167,21 +185,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "sender is listening on a non-loopback address without --client-auth (DELTA_CLIENT_AUTH); restrict access via firewall/NetworkPolicy or enable client auth"
                 );
             }
+            if insecure_tls {
+                warn!("--insecure-tls is enabled; do NOT use this in production");
+            }
             let cfg = sender::SenderConfig {
                 receiver_url: receiver_url.clone(),
                 secret,
                 client_auth,
                 max_cache_bytes: max_cache_mb * 1024 * 1024,
                 max_inflight_bytes: max_inflight_mb * 1024 * 1024,
+                max_concurrent_requests,
                 max_codec_concurrency,
                 ttl: Duration::from_secs(ttl_secs),
                 min_delta_bytes,
                 max_body_bytes: max_body_mb * 1024 * 1024,
                 zstd_level,
                 insecure_tls,
+                body_read_timeout: Duration::from_secs(body_read_timeout_secs),
                 read_timeout: Duration::from_secs(read_timeout_secs),
             };
-            let state = sender::SenderState::new(cfg)?;
+            if cfg.is_plaintext_non_loopback_receiver() {
+                warn!(
+                    receiver = %receiver_url,
+                    "receiver_url uses plaintext http:// to a non-loopback host; wrap receiver with HTTPS/TLS in production!"
+                );
+            }
+            let state = sender::SenderState::new(cfg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let _sweeper = state.spawn_sweeper();
 
             if let Some(admin_addr) = admin_listen {
@@ -202,6 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 receiver = %receiver_url,
                 max_cache_mb,
                 max_inflight_mb,
+                max_concurrent_requests,
                 max_codec_concurrency,
                 ttl_secs,
                 "ctx-delta-relay sender started"
@@ -219,27 +250,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             secret,
             max_cache_mb,
             max_inflight_mb,
+            max_concurrent_requests,
             max_codec_concurrency,
             ttl_secs,
             max_body_mb,
             cache_zstd_level,
             insecure_upstream_tls,
+            body_read_timeout_secs,
             read_timeout_secs,
         } => {
+            if !listen.ip().is_loopback() {
+                warn!(
+                    %listen,
+                    "receiver is listening on a non-loopback address without built-in TLS; prefer binding 127.0.0.1 behind an HTTPS reverse proxy"
+                );
+            }
             let cfg = receiver::ReceiverConfig {
                 upstream_url: upstream_url.clone(),
                 upstream_host,
                 secret,
                 max_cache_bytes: max_cache_mb * 1024 * 1024,
                 max_inflight_bytes: max_inflight_mb * 1024 * 1024,
+                max_concurrent_requests,
                 max_codec_concurrency,
                 ttl: Duration::from_secs(ttl_secs),
                 max_body_bytes: max_body_mb * 1024 * 1024,
                 cache_zstd_level,
                 insecure_upstream_tls,
+                body_read_timeout: Duration::from_secs(body_read_timeout_secs),
                 read_timeout: Duration::from_secs(read_timeout_secs),
             };
-            let state = receiver::ReceiverState::new(cfg)?;
+            let state = receiver::ReceiverState::new(cfg)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
             let _sweeper = state.spawn_sweeper();
 
             if let Some(admin_addr) = admin_listen {
@@ -260,6 +302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 upstream = %upstream_url,
                 max_cache_mb,
                 max_inflight_mb,
+                max_concurrent_requests,
                 max_codec_concurrency,
                 ttl_secs,
                 "ctx-delta-relay receiver started"
@@ -273,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// BUG-15: Graceful shutdown on both SIGINT (Ctrl+C) and Unix SIGTERM (systemd stop/restart).
+/// Graceful shutdown on both SIGINT (Ctrl+C) and Unix SIGTERM (systemd stop/restart).
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
