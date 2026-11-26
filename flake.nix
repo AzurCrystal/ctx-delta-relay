@@ -69,11 +69,19 @@
               };
               environmentFile = lib.mkOption {
                 type = lib.types.path;
-                description = "Secret file defining DELTA_SECRET=... (e.g. managed by sops-nix / agenix)";
+                description = "Secret file defining DELTA_SECRET=... (and optionally DELTA_CLIENT_AUTH=...)";
               };
               maxCacheMb = lib.mkOption {
                 type = lib.types.int;
                 default = 256;
+              };
+              maxInflightMb = lib.mkOption {
+                type = lib.types.int;
+                default = 64;
+              };
+              maxCodecConcurrency = lib.mkOption {
+                type = lib.types.int;
+                default = 4;
               };
               ttlSecs = lib.mkOption {
                 type = lib.types.int;
@@ -111,6 +119,14 @@
                 type = lib.types.int;
                 default = 256;
               };
+              maxInflightMb = lib.mkOption {
+                type = lib.types.int;
+                default = 64;
+              };
+              maxCodecConcurrency = lib.mkOption {
+                type = lib.types.int;
+                default = 4;
+              };
               ttlSecs = lib.mkOption {
                 type = lib.types.int;
                 default = 1800;
@@ -130,7 +146,7 @@
                   EnvironmentFile = cfg.sender.environmentFile;
                   Restart = "always";
                   RestartSec = "2s";
-                  MemoryMax = "${toString (cfg.sender.maxCacheMb + 192)}M";
+                  MemoryMax = "${toString (cfg.sender.maxCacheMb + cfg.sender.maxInflightMb + 128)}M";
                   ExecStart = lib.concatStringsSep " " (
                     [
                       "${pkg}/bin/ctx-delta-relay"
@@ -138,6 +154,8 @@
                       "--listen=${cfg.sender.listen}"
                       "--receiver-url=${cfg.sender.receiverUrl}"
                       "--max-cache-mb=${toString cfg.sender.maxCacheMb}"
+                      "--max-inflight-mb=${toString cfg.sender.maxInflightMb}"
+                      "--max-codec-concurrency=${toString cfg.sender.maxCodecConcurrency}"
                       "--ttl-secs=${toString cfg.sender.ttlSecs}"
                       "--zstd-level=${toString cfg.sender.zstdLevel}"
                     ]
@@ -158,7 +176,7 @@
                   EnvironmentFile = cfg.receiver.environmentFile;
                   Restart = "always";
                   RestartSec = "2s";
-                  MemoryMax = "${toString (cfg.receiver.maxCacheMb + 192)}M";
+                  MemoryMax = "${toString (cfg.receiver.maxCacheMb + cfg.receiver.maxInflightMb + 128)}M";
                   ExecStart = lib.concatStringsSep " " (
                     [
                       "${pkg}/bin/ctx-delta-relay"
@@ -166,6 +184,8 @@
                       "--listen=${cfg.receiver.listen}"
                       "--upstream-url=${cfg.receiver.upstreamUrl}"
                       "--max-cache-mb=${toString cfg.receiver.maxCacheMb}"
+                      "--max-inflight-mb=${toString cfg.receiver.maxInflightMb}"
+                      "--max-codec-concurrency=${toString cfg.receiver.maxCodecConcurrency}"
                       "--ttl-secs=${toString cfg.receiver.ttlSecs}"
                     ]
                     ++ lib.optional (cfg.receiver.upstreamHost != null) "--upstream-host=${cfg.receiver.upstreamHost}"

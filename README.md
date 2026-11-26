@@ -35,7 +35,7 @@
 2. **零磁盘 + 硬内存上限**：双端 LRU 仅缓存 **zstd 压缩态快照**（1 MB 原始上下文仅占 ~150 KB 内存），严格强制 `current_bytes <= max_cache_bytes`，并内置空闲 TTL 淘汰与每分钟定期清理。
 3. **过期 / 重启 100% 透明自愈**：无论会话几天前过期、对端重启还是 LRU 触发淘汰，`receiver` 仅回一个极小的 `409` (`X-Delta-Miss: 1`)，`sender` 立刻自动回退重发一次独立 `zstd` 全量包，客户端完全无感知，且与上游真实 `409` 响应严格隔离。
 4. **并发会话防碰撞**：无需客户端配合，优先识别 `x-session-id` → `prompt_cache_key` / `session_id` → `(Authorization 哈希, model, 首条 user 消息切片)` 作为会话指纹，同一用户同时跑多个共享相同 System Prompt 与工具定义的 Agent 也不会互相覆盖。
-5. **零缓冲 SSE 流式转发**：响应侧通过 `bytes_stream` 逐块透传，不增加首包延迟（TTFT）。
+5. **零缓冲 SSE 流式转发与生产级防护**：响应侧通过 `bytes_stream` 逐块透传并记录中途断流错误；内置并发内存预算背压（`--max-inflight-mb` + `--max-codec-concurrency` 防 OOM）、禁用自动 HTTP 重定向防密钥泄露、`X-Delta-Cached` 显式缓存确认、可选发送端访问鉴权（`--client-auth`），以及 Unix `SIGTERM`/`SIGINT` 优雅停机。*(注：本工具专注 HTTP/SSE 长上下文中继；WebSocket 升级请求会显式返回 `501` 避免静默破坏连接，Responses WebSocket 模式建议直连上游。)*
 
 ## 部署文档
 

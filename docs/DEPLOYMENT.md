@@ -78,13 +78,15 @@ ExecStart=/usr/local/bin/ctx-delta-relay receiver \
   --admin-listen 127.0.0.1:18081 \
   --upstream-url http://127.0.0.1:3000 \
   --max-cache-mb 256 \
+  --max-inflight-mb 64 \
+  --max-codec-concurrency 4 \
   --ttl-secs 1800 \
   --max-body-mb 16 \
   --cache-zstd-level 1 \
   --read-timeout-secs 300
 Restart=always
 RestartSec=2s
-# 系统级硬内存兜底（缓存上限 256M + 运行时富余 192M）
+# 系统级硬内存兜底（缓存上限 256M + 并发内存预算 64M + 运行时富余 128M）
 MemoryMax=448M
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -221,6 +223,8 @@ ExecStart=/usr/local/bin/ctx-delta-relay sender \
   --admin-listen 127.0.0.1:18081 \
   --receiver-url https://relay.example.com:18443 \
   --max-cache-mb 256 \
+  --max-inflight-mb 64 \
+  --max-codec-concurrency 4 \
   --ttl-secs 1500 \
   --min-delta-bytes 4096 \
   --max-body-mb 16 \
@@ -314,9 +318,11 @@ curl -s http://127.0.0.1:18081/stats | jq .
   "mode_delta_total": 37,
   "miss_retries_total": 0,
   "errors_total": 0,
+  "stream_errors_total": 0,
+  "overload_rejects_total": 0,
   "raw_bytes_total": 24851200,
   "wire_bytes_total": 412800,
-  "saved_bytes_total": 24438400,
+  "net_saved_bytes": 24438400,
   "savings_percent": 98.34,
   "lru_entries": 3,
   "lru_bytes": 195400,
@@ -350,3 +356,6 @@ sudo systemctl restart ctx-delta-relay-receiver
 | 长思考模型中途断连（504） | Nginx `proxy_read_timeout` 或 `--read-timeout-secs` 过短 | 调大至 `600s` |
 | `miss_retries_total` 持续偏高 | `sender` TTL 大于 `receiver` TTL，或 `receiver` 的 `--max-cache-mb` 过小导致活跃会话频繁被淘汰 | 保持 `sender.ttl < receiver.ttl`（如 1500 vs 1800），并将 `receiver` 的 `--max-cache-mb` 设为 `256`–`512` |
 | 仅想临时直连自签证书测试 | 尚未给 `receiver` 配正式域名证书 | 测试期可在 `sender` 临时加 `--insecure-tls`（**生产环境请勿开启**，务必使用正式证书） |
+| 非回环地址部署 `sender` | `sender` 监听在 `0.0.0.0` 或跨 Pod 访问 | 建议在 `EnvironmentFile` 中同时配置 `DELTA_CLIENT_AUTH=<secret>`（调用方附带 `X-Delta-Client-Auth`）或用 NetworkPolicy/防火墙限制来源 |
+| 遇到 `501 Not Implemented` | 请求携带 `Upgrade: websocket` | 本组件专注 HTTP/SSE 长上下文增量压缩；WebSocket 协议（如 OpenAI Responses WS 模式本身已带增量）请直连上游，不经本中继 |
+| 遇到 `503 Service Unavailable` | 瞬时大请求并发超过 `--max-inflight-mb` 内存背压上限 | 保护进程不被 OOM Kill；按机器内存调大 `--max-inflight-mb` 与 `--max-codec-concurrency` |

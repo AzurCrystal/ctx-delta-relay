@@ -3,7 +3,7 @@ use ctx_delta_relay::{receiver, sender};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -19,9 +19,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Run the GCP / client-side delta encoder sidecar (receives plaintext LLM API requests)
+    /// Run the client/egress-side delta encoder sidecar (receives plaintext LLM API requests)
     Sender {
-        /// Local address to listen on for new-api / client requests
+        /// Local address to listen on for gateway / client requests
         #[arg(long, env = "DELTA_LISTEN", default_value = "127.0.0.1:18080")]
         listen: SocketAddr,
 
@@ -37,9 +37,21 @@ enum Command {
         #[arg(long, env = "DELTA_SECRET")]
         secret: String,
 
+        /// Optional client access secret (X-Delta-Client-Auth) recommended if binding non-loopback
+        #[arg(long, env = "DELTA_CLIENT_AUTH")]
+        client_auth: Option<String>,
+
         /// Hard RAM cap in MiB for sender compressed snapshot LRU
         #[arg(long, env = "DELTA_MAX_CACHE_MB", default_value_t = 256)]
         max_cache_mb: usize,
+
+        /// Hard RAM budget in MiB for concurrent in-flight body & codec buffers
+        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 64)]
+        max_inflight_mb: usize,
+
+        /// Max concurrent blocking zstd codec tasks
+        #[arg(long, env = "DELTA_MAX_CODEC_CONCURRENCY", default_value_t = 4)]
+        max_codec_concurrency: usize,
 
         /// Snapshot TTL in seconds (set slightly shorter than receiver TTL, e.g. 1500 vs 1800)
         #[arg(long, env = "DELTA_TTL_SECS", default_value_t = 1500)]
@@ -69,7 +81,7 @@ enum Command {
     /// Run the upstream-side Hydrator (reconstructs exact request bodies and forwards locally)
     Receiver {
         /// Listen address for incoming delta-encoded requests
-        #[arg(long, env = "DELTA_LISTEN", default_value = "0.0.0.0:18080")]
+        #[arg(long, env = "DELTA_LISTEN", default_value = "127.0.0.1:18080")]
         listen: SocketAddr,
 
         /// Optional local admin address for /healthz and /stats
@@ -91,6 +103,14 @@ enum Command {
         /// Strict RAM cap in MiB for receiver compressed snapshot LRU (zero disk)
         #[arg(long, env = "DELTA_MAX_CACHE_MB", default_value_t = 256)]
         max_cache_mb: usize,
+
+        /// Hard RAM budget in MiB for concurrent in-flight body & codec buffers
+        #[arg(long, env = "DELTA_MAX_INFLIGHT_MB", default_value_t = 64)]
+        max_inflight_mb: usize,
+
+        /// Max concurrent blocking zstd codec tasks
+        #[arg(long, env = "DELTA_MAX_CODEC_CONCURRENCY", default_value_t = 4)]
+        max_codec_concurrency: usize,
 
         /// Snapshot idle TTL in seconds
         #[arg(long, env = "DELTA_TTL_SECS", default_value_t = 1800)]
@@ -130,7 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             admin_listen,
             receiver_url,
             secret,
+            client_auth,
             max_cache_mb,
+            max_inflight_mb,
+            max_codec_concurrency,
             ttl_secs,
             min_delta_bytes,
             max_body_mb,
@@ -138,10 +161,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             insecure_tls,
             read_timeout_secs,
         } => {
+            if !listen.ip().is_loopback() && client_auth.is_none() {
+                warn!(
+                    %listen,
+                    "sender is listening on a non-loopback address without --client-auth (DELTA_CLIENT_AUTH); restrict access via firewall/NetworkPolicy or enable client auth"
+                );
+            }
             let cfg = sender::SenderConfig {
                 receiver_url: receiver_url.clone(),
                 secret,
+                client_auth,
                 max_cache_bytes: max_cache_mb * 1024 * 1024,
+                max_inflight_bytes: max_inflight_mb * 1024 * 1024,
+                max_codec_concurrency,
                 ttl: Duration::from_secs(ttl_secs),
                 min_delta_bytes,
                 max_body_bytes: max_body_mb * 1024 * 1024,
@@ -157,7 +189,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let admin_listener = TcpListener::bind(admin_addr).await?;
                 info!(%admin_addr, "sender admin endpoint listening (/healthz, /stats)");
                 tokio::spawn(async move {
-                    let _ = axum::serve(admin_listener, admin_app).await;
+                    let _ = axum::serve(admin_listener, admin_app)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await;
                 });
             }
 
@@ -167,6 +201,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 %listen,
                 receiver = %receiver_url,
                 max_cache_mb,
+                max_inflight_mb,
+                max_codec_concurrency,
                 ttl_secs,
                 "ctx-delta-relay sender started"
             );
@@ -182,6 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             upstream_host,
             secret,
             max_cache_mb,
+            max_inflight_mb,
+            max_codec_concurrency,
             ttl_secs,
             max_body_mb,
             cache_zstd_level,
@@ -193,6 +231,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 upstream_host,
                 secret,
                 max_cache_bytes: max_cache_mb * 1024 * 1024,
+                max_inflight_bytes: max_inflight_mb * 1024 * 1024,
+                max_codec_concurrency,
                 ttl: Duration::from_secs(ttl_secs),
                 max_body_bytes: max_body_mb * 1024 * 1024,
                 cache_zstd_level,
@@ -207,7 +247,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let admin_listener = TcpListener::bind(admin_addr).await?;
                 info!(%admin_addr, "receiver admin endpoint listening (/healthz, /stats)");
                 tokio::spawn(async move {
-                    let _ = axum::serve(admin_listener, admin_app).await;
+                    let _ = axum::serve(admin_listener, admin_app)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await;
                 });
             }
 
@@ -217,6 +259,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 %listen,
                 upstream = %upstream_url,
                 max_cache_mb,
+                max_inflight_mb,
+                max_codec_concurrency,
                 ttl_secs,
                 "ctx-delta-relay receiver started"
             );
@@ -229,7 +273,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// BUG-15: Graceful shutdown on both SIGINT (Ctrl+C) and Unix SIGTERM (systemd stop/restart).
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    info!("shutdown signal received, draining connections");
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sigterm.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("SIGINT received, draining in-flight connections"),
+        _ = terminate => info!("SIGTERM received, draining in-flight connections"),
+    }
 }
